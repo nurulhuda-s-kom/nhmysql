@@ -1,0 +1,25 @@
+[package]
+name = "nhmysql"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nurul Huda <nurulhuda@bondowoso.go.id>"]
+description = "CLI tool to generate Rust model structs from MySQL table schemas"
+license = "MIT"
+repository = "https://github.com/nurulhuda-s-kom/nhmysql"
+keywords = ["mysql", "model", "generator", "cli", "codegen"]
+categories = ["command-line-utilities", "database"]
+readme = "README.md"
+
+[[bin]]
+name = "nhmysql"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+sqlx = { version = "0.8", features = ["mysql", "runtime-tokio", "chrono"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
+chrono = "0.4"
+dotenv = { package = "dotenv-ng", version = "1" }
+dialoguer = { version = "0.11", features = ["password"] }
+console = "0.15"

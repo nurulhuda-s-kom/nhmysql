@@ -1,0 +1,399 @@
+/*
+ * -----------------------------------------------------------
+ *  Project  : nhmysql - MySQL Model Generator for Rust
+ *  Author   : Nurul Huda, S.Kom
+ *  Contact  : +62823-1371-4009
+ *  License  : MIT
+ * -----------------------------------------------------------
+ */
+
+use anyhow::{anyhow, Result};
+use chrono::Local;
+use clap::Parser;
+use console::style;
+use sqlx::mysql::MySqlPoolOptions;
+use std::fs;
+
+mod scaffolder;
+
+/// Generate Rust model structs from MySQL table schemas
+#[derive(Parser)]
+#[command(
+    name = "nhmysql",
+    version,
+    about = "Generate Rust model structs from MySQL table schemas",
+    long_about = "nhmysql connects to a MySQL database, reads the table schema,\nand generates Rust struct files with serde and sqlx derives.\n\nIf no DATABASE_URL is found, nhmysql will help you create a .env file\nand configure your Rust project automatically."
+)]
+struct Args {
+    /// Table name(s) to generate
+    tables: Vec<String>,
+
+    /// Database URL (overrides DATABASE_URL env var)
+    #[arg(short, long)]
+    database_url: Option<String>,
+
+    /// Output directory (default: auto-detect src/ folder, then use src/models/)
+    #[arg(short, long)]
+    output: Option<String>,
+
+    /// Generate all tables in the database
+    #[arg(short, long)]
+    all: bool,
+
+    /// Include timestamp fields (created_at, updated_at)
+    #[arg(long, default_value = "true")]
+    timestamps: bool,
+
+    /// Custom header comment
+    #[arg(long)]
+    header: Option<String>,
+
+    /// Skip generating mod.rs
+    #[arg(long)]
+    no_mod: bool,
+
+    /// Skip auto-setup (.env, Cargo.toml, main.rs)
+    #[arg(long)]
+    no_setup: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ColumnInfo {
+    name: String,
+    data_type: String,
+    is_nullable: bool,
+    column_default: Option<String>,
+    column_key: String,
+    extra: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // Auto-detect DATABASE_URL
+    let database_url = match resolve_database_url(&args)? {
+        Some(url) => url,
+        None => {
+            // No DATABASE_URL found — run scaffolder
+            if args.no_setup {
+                return Err(anyhow!(
+                    "{}",
+                    style("DATABASE_URL not found. Run without --no-setup to auto-configure, or use --database-url.")
+                        .red()
+                        .bold()
+                ));
+            }
+
+            println!(
+                "\n{}",
+                style("╔══════════════════════════════════════════╗").cyan()
+            );
+            println!(
+                "{}",
+                style("║  DATABASE_URL not found                  ║").cyan()
+            );
+            println!(
+                "{}",
+                style("║  Let's set up your project!              ║").cyan()
+            );
+            println!(
+                "{}\n",
+                style("╚══════════════════════════════════════════╝").cyan()
+            );
+
+            scaffolder::setup_database_url()?
+        }
+    };
+
+    // Connect to database
+    println!("{}", style("Connecting to database...").yellow());
+    let pool = MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+
+    println!("{}", style("Connected successfully!").green().bold());
+
+    // Get tables to process
+    let tables = if args.all {
+        get_all_tables(&pool).await?
+    } else if args.tables.is_empty() {
+        return Err(anyhow!(
+            "{}",
+            style("Provide table name(s) or use --all to generate all tables")
+                .red()
+                .bold()
+        ));
+    } else {
+        args.tables.clone()
+    };
+
+    // Create output directory
+    let output_dir = resolve_output_dir(&args.output)?;
+    fs::create_dir_all(&output_dir)?;
+
+    // Process each table
+    let mut generated_files = Vec::new();
+    let mut mod_entries = Vec::new();
+
+    for table in &tables {
+        println!("Processing: {}", style(table).cyan());
+
+        let columns = query_table_columns(&pool, table).await?;
+        if columns.is_empty() {
+            println!(
+                "  {} table '{}' not found or has no columns, skipping.",
+                style("Warning:").yellow(),
+                table
+            );
+            continue;
+        }
+
+        let code = generate_model(table, &columns, &args);
+        let snake_name = to_snake_case(table);
+        let filename = format!("{}/{}.rs", output_dir, snake_name);
+
+        fs::write(&filename, &code)?;
+        println!("  Generated: {}", style(&filename).green());
+
+        mod_entries.push(format!("pub mod {};", snake_name));
+        generated_files.push(filename);
+    }
+
+    // Generate mod.rs (skip if --no-mod)
+    if !mod_entries.is_empty() && !args.no_mod {
+        let mod_path = format!("{}/mod.rs", output_dir);
+        let mut mod_content = format!(
+            "/*\n * -----------------------------------------------------------\n *  Generated by nhmysql - {}\n * -----------------------------------------------------------\n */\n\n",
+            Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
+        mod_entries.sort();
+        mod_content.push_str(&mod_entries.join("\n\n"));
+        mod_content.push('\n');
+
+        fs::write(&mod_path, &mod_content)?;
+        println!("Generated: {}", style(&mod_path).green());
+    }
+
+    println!(
+        "\n{} Generated {} model(s) in `{}/`",
+        style("Done!").green().bold(),
+        style(generated_files.len().to_string()).cyan().bold(),
+        style(output_dir)
+    );
+
+    Ok(())
+}
+
+/// Auto-detect output directory: always use src/models/
+fn resolve_output_dir(output_arg: &Option<String>) -> Result<String> {
+    if let Some(output) = output_arg {
+        return Ok(output.clone());
+    }
+
+    Ok("src/models".to_string())
+}
+
+/// Try to find DATABASE_URL from CLI args, .env file, or environment
+fn resolve_database_url(args: &Args) -> Result<Option<String>> {
+    // 1. CLI argument has highest priority
+    if let Some(url) = &args.database_url {
+        return Ok(Some(url.clone()));
+    }
+
+    // 2. Try loading .env file using dotenv's EnvMap
+    if let Ok(env_map) = dotenv::EnvLoader::new().load() {
+        if let Ok(url) = env_map.var("DATABASE_URL") {
+            return Ok(Some(url));
+        }
+    }
+
+    // 3. Try environment variable
+    if let Ok(url) = std::env::var("DATABASE_URL") {
+        return Ok(Some(url));
+    }
+
+    Ok(None)
+}
+
+async fn get_all_tables(pool: &sqlx::MySqlPool) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME"
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|(name,)| name).collect())
+}
+
+async fn query_table_columns(pool: &sqlx::MySqlPool, table: &str) -> Result<Vec<ColumnInfo>> {
+    let rows: Vec<(String, String, String, Option<String>, String, String)> =
+        sqlx::query_as(
+            "SELECT
+                COLUMN_NAME,
+                DATA_TYPE,
+                IS_NULLABLE,
+                COLUMN_DEFAULT,
+                COLUMN_KEY,
+                EXTRA
+             FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE()
+               AND TABLE_NAME = ?
+             ORDER BY ORDINAL_POSITION",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(name, data_type, is_nullable, column_default, column_key, extra)| {
+            ColumnInfo {
+                name,
+                data_type,
+                is_nullable: is_nullable == "YES",
+                column_default,
+                column_key,
+                extra,
+            }
+        })
+        .collect())
+}
+
+fn generate_model(table_name: &str, columns: &[ColumnInfo], args: &Args) -> String {
+    let struct_name = to_pascal_case(table_name);
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+
+    let header_comment = args.header.as_deref().unwrap_or("nhmysql - MySQL Model Generator");
+
+    let mut lines: Vec<String> = Vec::new();
+
+    // Header
+    lines.push("/*".into());
+    lines.push(" * -----------------------------------------------------------".into());
+    lines.push(format!(" *  {}", header_comment));
+    lines.push(format!(" *  Table: {}", table_name));
+    lines.push(format!(" *  Generated: {}", timestamp));
+    lines.push(" *  Author: Nurul Huda, S.Kom".into());
+    lines.push(" * -----------------------------------------------------------".into());
+    lines.push(" */".into());
+    lines.push("".into());
+
+    // Derives
+    lines.push("#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]".into());
+    lines.push(format!("pub struct {} {{", struct_name));
+
+    for col in columns {
+        let field_name = to_snake_case(&col.name);
+        let rust_type = mysql_to_rust_type(&col.data_type, col.is_nullable, &col.extra);
+
+        // Skip auto-generated timestamp fields if --no-timestamps
+        if !args.timestamps
+            && (col.name == "created_at" || col.name == "updated_at")
+            && col.extra.contains("CURRENT_TIMESTAMP")
+        {
+            continue;
+        }
+
+        // Add comment for primary key
+        if col.column_key == "PRI" {
+            lines.push(format!("    /// Primary key"));
+        }
+
+        lines.push(format!("    pub {}: {},", field_name, rust_type));
+    }
+
+    lines.push("}".into());
+
+    // Add helper impl for table name
+    lines.push("".into());
+    lines.push(format!("impl {} {{", struct_name));
+    lines.push(format!("    /// Returns the MySQL table name"));
+    lines.push(format!("    pub fn table_name() -> &'static str {{"));
+    lines.push(format!("        \"{}\"", table_name));
+    lines.push(format!("    }}"));
+    lines.push("}".into());
+
+    lines.join("\n")
+}
+
+fn mysql_to_rust_type(mysql_type: &str, nullable: bool, extra: &str) -> String {
+    let base = match mysql_type {
+        // Integer types
+        "tinyint" => {
+            if extra.contains("UNSIGNED") { "u8" } else { "i8" }
+        }
+        "smallint" => {
+            if extra.contains("UNSIGNED") { "u16" } else { "i16" }
+        }
+        "mediumint" => {
+            if extra.contains("UNSIGNED") { "u32" } else { "i32" }
+        }
+        "int" | "integer" => {
+            if extra.contains("UNSIGNED") { "u32" } else { "i32" }
+        }
+        "bigint" => {
+            if extra.contains("UNSIGNED") { "u64" } else { "i64" }
+        }
+
+        // Floating point
+        "float" => "f32",
+        "double" => "f64",
+        "decimal" | "numeric" => "f64",
+
+        // String types
+        "varchar" | "char" | "text" | "tinytext" | "mediumtext" | "longtext" => "String",
+
+        // Date/Time types
+        "datetime" | "timestamp" | "date" | "time" | "year" => "String",
+
+        // Boolean
+        "boolean" | "bool" => "bool",
+
+        // Binary
+        "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" => "Vec<u8>",
+
+        // JSON
+        "json" => "serde_json::Value",
+
+        // Enum/Set (MySQL specific)
+        "enum" | "set" => "String",
+
+        // Default
+        _ => "String",
+    };
+
+    if nullable {
+        format!("Option<{}>", base)
+    } else {
+        base.to_string()
+    }
+}
+
+fn to_pascal_case(s: &str) -> String {
+    s.split('_')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => {
+                    let upper: String = first.to_uppercase().collect();
+                    let rest: String = chars.collect::<String>().to_lowercase();
+                    format!("{}{}", upper, rest)
+                }
+            }
+        })
+        .collect()
+}
+
+fn to_snake_case(s: &str) -> String {
+    let mut result = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            result.push('_');
+        }
+        result.push(ch.to_lowercase().next().unwrap_or(ch));
+    }
+    result
+}
